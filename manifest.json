@@ -1,0 +1,103 @@
+{
+  "id": "hunyuan3d-21-lowvram",
+  "name": "Hunyuan3D 2.1 Full - Low VRAM",
+  "type": "model",
+  "source": "https://github.com/AlefK1708/modly-hunyuan3d-21-lowvram",
+  "description": "Full Hunyuan Shape 2.1 (3.3B, no Mini/Turbo and no Paint), with low-RAM mmap/meta loading and native GLB export in Modly.",
+  "version": "0.3.1",
+  "author": "AlefK1708",
+  "vram_gb": 8,
+  "generator_class": "Hunyuan3D21LowVRAMGenerator",
+  "tags": ["image-to-3d", "hunyuan3d-2.1", "full-model", "low-vram"],
+  "nodes": [
+    {
+      "id": "generate",
+      "name": "Hunyuan Shape 2.1 - Full Low VRAM",
+      "input": "image",
+      "output": "mesh",
+      "hf_repo": "Comfy-Org/hunyuan3D_2.1_repackaged",
+      "download_check": "hunyuan_3d_v2.1.safetensors",
+      "hf_include_prefixes": ["hunyuan_3d_v2.1.safetensors"],
+      "params_schema": [
+        {
+          "id": "precision",
+          "label": "Mesh Precision",
+          "type": "select",
+          "default": "int8",
+          "options": [
+            {"value": "int8", "label": "INT8 - recommended"},
+            {"value": "fp8", "label": "FP8 - experimental"},
+            {"value": "fp16", "label": "FP16 - high RAM usage"}
+          ],
+          "tooltip": "Quantization is performed locally at runtime. INT8 uses less RAM; FP16 preserves the original weights but relies heavily on the Windows page file."
+        },
+        {
+          "id": "num_inference_steps",
+          "label": "Quality",
+          "type": "select",
+          "default": 30,
+          "options": [
+            {"value": 20, "label": "Fast - 20 steps"},
+            {"value": 30, "label": "Balanced - 30 steps"},
+            {"value": 50, "label": "High - 50 steps"}
+          ],
+          "tooltip": "More steps increase generation time; every option still uses the full Hunyuan3D 2.1 model."
+        },
+        {
+          "id": "octree_resolution",
+          "label": "Mesh Resolution",
+          "type": "select",
+          "default": 256,
+          "options": [
+            {"value": 256, "label": "256 - recommended"},
+            {"value": 320, "label": "Detailed - 320"},
+            {"value": 384, "label": "Maximum - 384"}
+          ],
+          "tooltip": "Reconstruction at 384 can run out of VRAM on complex geometry. Start at 256."
+        },
+        {
+          "id": "num_chunks",
+          "label": "Reconstruction Memory",
+          "type": "select",
+          "default": 4000,
+          "options": [
+            {"value": 2000, "label": "Minimum - slower"},
+            {"value": 4000, "label": "Balanced - 4,000"},
+            {"value": 8000, "label": "Faster - more VRAM"}
+          ],
+          "tooltip": "Batch size used by the volume decoder. Reduce it to 2000 if the final stage runs out of CUDA memory."
+        },
+        {
+          "id": "guidance_scale",
+          "label": "Guidance Scale",
+          "type": "float",
+          "default": 5.0,
+          "min": 1.0,
+          "max": 10.0,
+          "step": 0.5,
+          "tooltip": "Controls adherence to the input image. The official Hunyuan3D 2.1 default is 5.0."
+        },
+        {
+          "id": "remove_background",
+          "label": "Remove Background",
+          "type": "select",
+          "default": "on",
+          "options": [
+            {"value": "on", "label": "On"},
+            {"value": "off", "label": "Off"}
+          ],
+          "tooltip": "Uses rembg on the CPU. PNG images that already contain transparency are not processed again."
+        },
+        {
+          "id": "seed",
+          "label": "Seed",
+          "type": "int",
+          "default": -1,
+          "min": -1,
+          "max": 4294967295,
+          "tooltip": "Use -1 for a random seed."
+        }
+      ]
+    }
+  ]
+}
