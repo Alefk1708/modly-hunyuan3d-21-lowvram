@@ -168,6 +168,10 @@ Notice.txt
 - **deepbeepmeep** - MMGP and low-VRAM offloading techniques used by this adapter.
 - **Comfy-Org** - hosting for the combined Safetensors repack; it is not used as a backend.
 
+### Independence notice
+
+This is an independent community extension maintained by **AlefK1708**. Tencent is not affiliated with, associated with, sponsoring, or endorsing this extension or Modly. The Tencent Hunyuan name is used only to identify the upstream model and software on which this extension depends.
+
 The adapter is distributed under GPL-3.0 because of the WinPortable base used during adaptation; see `LICENSE`. Hunyuan3D 2.1 code and weights remain subject to `LICENSE-HUNYUAN-3D-2.1.txt` and `Notice.txt`.
 
 Before public redistribution or commercial use, read the complete Hunyuan license. It has its own territorial and use restrictions. This repository does not grant any additional rights to Tencent's model.

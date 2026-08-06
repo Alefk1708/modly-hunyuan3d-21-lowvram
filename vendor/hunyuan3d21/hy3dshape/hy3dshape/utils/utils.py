@@ -12,6 +12,11 @@
 # fine-tuning enabling code and other elements of the foregoing made publicly available
 # by Tencent in accordance with TENCENT HUNYUAN COMMUNITY LICENSE AGREEMENT.
 
+# MODIFICATION NOTICE:
+# Modified by AlefK1708 for the Modly extension.
+# Changes in this file are limited to English comment translation;
+# runtime behavior is unchanged. See LICENSE-HUNYUAN-3D-2.1.txt and Notice.txt.
+
 import logging
 import os
 from functools import wraps
