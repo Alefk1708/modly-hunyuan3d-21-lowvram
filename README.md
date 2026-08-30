@@ -3,7 +3,7 @@
 Native [Modly](https://github.com/lightningpixel/modly) extension for generating **3D meshes** from an image with the **full Hunyuan Shape 2.1 model (3.3B)** on NVIDIA GPUs with limited VRAM.
 
 - Author and maintainer: **AlefK1708**
-- Version: **0.3.1**
+- Version: **0.4.0**
 - Repository: [AlefK1708/modly-hunyuan3d-21-lowvram](https://github.com/AlefK1708/modly-hunyuan3d-21-lowvram)
 - Model: Hunyuan3D Shape 2.1 Full - this is not Mini, Turbo, or Turbo Mini.
 - Backend: native Modly Python integration; **no ComfyUI, Gradio, or external server is used**.
@@ -18,11 +18,25 @@ Main features:
 - Full Hunyuan Shape 2.1 with the complete Safetensors checkpoint.
 - INT8 recommended for GPUs with 8 GB of VRAM, experimental FP8, and FP16.
 - `meta` initialization, memory-mapped Safetensors loading, and MMGP offloading to reduce RAM peaks.
+- Chunk-streamed dense-grid reconstruction without allocating a complete XYZ cube in RAM.
 - Optional CPU background removal with `rembg`.
 - Native GLB export without Blender.
 - Attempts to release the heavy pipeline and RAM/VRAM caches after every generation, including errors and cancellations.
 
 The extension returns the geometry produced by Hunyuan Shape without automatic polygon reduction. If you want a lower-poly mesh, connect a dedicated mesh optimization node later in the Modly Workflow.
+
+## v0.4.0
+
+This release reduces peak memory without changing model weights, inference steps, guidance, mesh resolution, or output precision:
+
+- Streams dense-grid coordinates one reconstruction chunk at a time. The previous NumPy `meshgrid` plus `stack` path could temporarily allocate about **1.37 GB** at mesh resolution 384.
+- Writes decoder logits directly into their final FP32 field instead of retaining every chunk and creating a second full tensor with `torch.cat`.
+- Releases the CPU U2Net background-removal session before loading Hunyuan Shape.
+- Releases the Shape pipeline before GLB export buffers are created.
+- Uses lightweight cleanup between checkpoint components so hot pages are not evicted and immediately reloaded; aggressive cleanup remains enabled at lifecycle boundaries.
+- Adds CPU-only regression tests for grid ordering, chunk bounds, checkpoint namespace filtering, and cleanup order.
+
+The streamed coordinates use the same FP32 axes and `ij` ordering as the original decoder, and the logits are converted to FP32 at the same point in the computation. These changes target allocation overhead rather than reducing quality settings.
 
 ## v0.3.1
 
@@ -53,7 +67,7 @@ The primary target for this build is Windows 10/11 with an NVIDIA GPU and approx
 | Modly Python | 3.10, 3.11, or 3.12 | Python supplied by Modly |
 | Free space for a clean installation | About 20 GB | 30 GB or more |
 
-With 16 GB of physical RAM, the page file is a fallback and loading/quantization may temporarily make Windows less responsive. v0.3.1 avoids full FP32 initialization and drops the heavy pipeline after each generation, but no software configuration can guarantee the complete absence of memory peaks for every input and setting.
+With 16 GB of physical RAM, the page file is a fallback and loading/quantization may temporarily make Windows less responsive. v0.4.0 avoids full FP32 initialization, streams the reconstruction grid, and drops the heavy pipeline before export, but no software configuration can guarantee the complete absence of memory peaks for every input and setting.
 
 ## Downloaded model
 
@@ -111,7 +125,7 @@ The node output type is `mesh`, exactly as declared in `manifest.json`, so it re
 
 ## RAM and VRAM
 
-INT8 preparation can use a significant amount of RAM, CPU, and disk activity. The loader processes the checkpoint component by component through memory mapping and uses MMGP/Quanto to avoid keeping a second complete FP32 copy of the model.
+INT8 preparation can use a significant amount of RAM, CPU, and disk activity. The loader processes the checkpoint component by component through memory mapping and uses MMGP/Quanto to avoid keeping a second complete FP32 copy of the model. During mesh reconstruction, v0.4.0 keeps only the current coordinate chunk instead of the complete dense XYZ grid.
 
 At the end of generation, the UI should reach the memory-release stage and the log records:
 
@@ -152,12 +166,13 @@ requirements.txt
 setup.py
 configs/dit_config_2_1.yaml
 vendor/hunyuan3d21/hy3dshape/...
+tests/test_memory_optimizations.py
 LICENSE
 LICENSE-HUNYUAN-3D-2.1.txt
 Notice.txt
 ```
 
-`configs/` and `vendor/` are Shape 2.1 runtime dependencies, not tests. The public ZIP does not contain a `venv`, model weights, caches, Paint code, diagnostic scripts, or test files.
+`configs/` and `vendor/` are Shape 2.1 runtime dependencies. The lightweight `tests/` directory is source-only and is not needed during generation. The public ZIP does not contain a `venv`, model weights, caches, Paint code, or diagnostic scripts.
 
 ## Licenses and credits
 

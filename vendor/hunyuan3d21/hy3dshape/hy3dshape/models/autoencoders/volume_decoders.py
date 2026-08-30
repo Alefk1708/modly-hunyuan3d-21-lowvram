@@ -14,8 +14,10 @@
 
 # MODIFICATION NOTICE:
 # Modified by AlefK1708 for the Modly extension.
-# Changes in this file are limited to English comment/docstring translation;
-# runtime behavior is unchanged. See LICENSE-HUNYUAN-3D-2.1.txt and Notice.txt.
+# Changes include English comment/docstring translation and a memory-streamed
+# dense-grid decoder for the Modly low-RAM runtime. The streamed decoder keeps
+# the original grid coordinates and logits precision unchanged. See
+# LICENSE-HUNYUAN-3D-2.1.txt and Notice.txt.
 
 from typing import Union, Tuple, List, Callable
 
@@ -143,6 +145,22 @@ def generate_dense_grid_points(
     return xyz, grid_size, length
 
 
+def generate_dense_grid_axes(
+    bbox_min: np.ndarray,
+    bbox_max: np.ndarray,
+    octree_resolution: int,
+):
+    """Return the three small coordinate axes instead of a dense XYZ cube."""
+
+    length = bbox_max - bbox_min
+    side = int(octree_resolution) + 1
+    axes = tuple(
+        np.linspace(bbox_min[axis], bbox_max[axis], side, dtype=np.float32)
+        for axis in range(3)
+    )
+    return axes, [side, side, side], length
+
+
 class VanillaVolumeDecoder:
     @torch.no_grad()
     def __call__(
@@ -164,25 +182,55 @@ class VanillaVolumeDecoder:
             bounds = [-bounds, -bounds, -bounds, bounds, bounds, bounds]
 
         bbox_min, bbox_max = np.array(bounds[0:3]), np.array(bounds[3:6])
-        xyz_samples, grid_size, length = generate_dense_grid_points(
+        axes, grid_size, length = generate_dense_grid_axes(
             bbox_min=bbox_min,
             bbox_max=bbox_max,
             octree_resolution=octree_resolution,
-            indexing="ij"
         )
-        xyz_samples = torch.from_numpy(xyz_samples).to(device, dtype=dtype).contiguous().reshape(-1, 3)
+        del length
+        axis_tensors = tuple(torch.from_numpy(axis).to(device, dtype=dtype) for axis in axes)
+        total_points = int(np.prod(grid_size, dtype=np.int64))
+        yz_plane = grid_size[1] * grid_size[2]
 
-        # 2. latents to 3d volume
-        batch_logits = []
-        for start in tqdm(range(0, xyz_samples.shape[0], num_chunks), desc=f"Volume Decoding",
+        # 2. Stream query coordinates directly on the target device. Building
+        # np.meshgrid + np.stack used two complete dense coordinate cubes
+        # simultaneously (about 1.28 GiB / 1.37 GB at resolution 384) before
+        # inference even started. Flat ij indices reproduce the same axis values and
+        # ordering while keeping only one chunk alive.
+        grid_logits = None
+        for start in tqdm(range(0, total_points, num_chunks), desc=f"Volume Decoding",
                           disable=not enable_pbar):
-            chunk_queries = xyz_samples[start: start + num_chunks, :]
+            stop = min(start + num_chunks, total_points)
+            flat_indices = torch.arange(start, stop, device=device)
+            x_indices = torch.div(flat_indices, yz_plane, rounding_mode="floor")
+            remainder = flat_indices - x_indices * yz_plane
+            y_indices = torch.div(remainder, grid_size[2], rounding_mode="floor")
+            z_indices = remainder - y_indices * grid_size[2]
+            chunk_queries = torch.stack(
+                (
+                    axis_tensors[0][x_indices],
+                    axis_tensors[1][y_indices],
+                    axis_tensors[2][z_indices],
+                ),
+                dim=-1,
+            )
             chunk_queries = repeat(chunk_queries, "p c -> b p c", b=batch_size)
             logits = geo_decoder(queries=chunk_queries, latents=latents)
-            batch_logits.append(logits)
+            if grid_logits is None:
+                # The original path concatenated half-precision chunks and
+                # converted the final tensor to float32. Writing each chunk
+                # into its final float32 buffer is numerically equivalent and
+                # avoids both the Python list and torch.cat's full-size copy.
+                grid_logits = torch.empty(
+                    (batch_size, total_points, *logits.shape[2:]),
+                    dtype=torch.float32,
+                    device=logits.device,
+                )
+            grid_logits[:, start:stop].copy_(logits)
 
-        grid_logits = torch.cat(batch_logits, dim=1)
-        grid_logits = grid_logits.view((batch_size, *grid_size)).float()
+        if grid_logits is None:
+            raise RuntimeError("Volume decoding received an empty query grid.")
+        grid_logits = grid_logits.view((batch_size, *grid_size))
 
         return grid_logits
 
