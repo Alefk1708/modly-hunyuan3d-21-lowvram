@@ -39,8 +39,15 @@ def release_offloader(offloader) -> None:
             print(f"[Hunyuan3D21] Warning while releasing MMGP: {exc}")
 
 
-def trim_process_memory() -> None:
-    """Release Python, CUDA and Windows working-set memory when possible."""
+def trim_process_memory(*, aggressive: bool = True) -> None:
+    """Release unused memory without evicting hot pages during model loading.
+
+    ``EmptyWorkingSet`` and ``cuda.ipc_collect`` are useful at lifecycle
+    boundaries, but invoking them between checkpoint components forces Windows
+    and CUDA to fault pages back in almost immediately.  The lightweight mode
+    keeps the speed-sensitive loading path to garbage collection and the CUDA
+    allocator cache only.
+    """
 
     gc.collect()
     try:
@@ -49,11 +56,12 @@ def trim_process_memory() -> None:
         torch.set_default_device("cpu")
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
+            if aggressive:
+                torch.cuda.ipc_collect()
     except Exception:
         pass
 
-    if sys.platform == "win32":
+    if aggressive and sys.platform == "win32":
         try:
             import ctypes
 
@@ -101,8 +109,16 @@ class Hunyuan3D21LowVRAMGenerator(BaseGenerator):
         """Drop every heavy CPU/GPU reference owned by this generator."""
 
         self._release_shape()
-        self._rembg_session = None
+        self._release_background_remover()
         trim_process_memory()
+
+    def _release_background_remover(self) -> None:
+        """Do not overlap the CPU U2Net session with the 3D model weights."""
+
+        if self._rembg_session is None:
+            return
+        self._rembg_session = None
+        trim_process_memory(aggressive=False)
 
     @contextmanager
     def _auto_release_after_generation(self, progress_cb):
@@ -148,7 +164,14 @@ class Hunyuan3D21LowVRAMGenerator(BaseGenerator):
             seed &= 0xFFFFFFFF
 
             self._report(progress_cb, 2, "Preparing image...")
-            image = self._preprocess(image_bytes, remove_background)
+            try:
+                image = self._preprocess(image_bytes, remove_background)
+            finally:
+                # rembg is not used after preprocessing. Releasing its ONNX
+                # session here prevents it from overlapping the much larger
+                # Shape pipeline during loading and inference.
+                self._release_background_remover()
+                del image_bytes
             self._check_cancelled(cancel_event)
 
             self._report(progress_cb, 8, f"Loading full Hunyuan3D 2.1 ({precision.upper()})...")
@@ -168,6 +191,13 @@ class Hunyuan3D21LowVRAMGenerator(BaseGenerator):
                 progress_cb=progress_cb,
                 cancel_event=cancel_event,
             )
+            del image
+
+            # The mesh is fully materialized on the CPU at this point. Drop the
+            # streamed model before trimesh allocates its GLB export buffers, so
+            # the two memory peaks never overlap.
+            self._report(progress_cb, 90, "Releasing generation model before export...")
+            self._release_shape(aggressive=False)
 
             self.outputs_dir.mkdir(parents=True, exist_ok=True)
             stem = f"{int(time.time())}_{uuid.uuid4().hex[:8]}"
@@ -382,9 +412,10 @@ class Hunyuan3D21LowVRAMGenerator(BaseGenerator):
                     verboseLevel=1,
                 )
                 module.eval().requires_grad_(False)
-                # Release file-backed pages from the component just converted
-                # before opening the next namespace of the same checkpoint.
-                trim_process_memory()
+                # Release dead mappings before opening the next namespace, but
+                # keep hot model pages resident so the following MMGP scan does
+                # not have to page them back in.
+                trim_process_memory(aggressive=False)
 
             image_processor = instantiate_from_config(config["image_processor"])
             scheduler = instantiate_from_config(config["scheduler"])
@@ -409,26 +440,34 @@ class Hunyuan3D21LowVRAMGenerator(BaseGenerator):
 
     @staticmethod
     def _filter_shape_namespace(state_dict, quantization_map, prefix: str):
-        """Select only one top-level namespace from the combined checkpoint."""
+        """Select one checkpoint namespace without a second dictionary view.
+
+        MMGP gives this callback a private, temporary state dictionary. Mutating
+        it in place drops mmap tensor handles for unrelated components as soon
+        as possible and avoids briefly retaining both the full and filtered
+        dictionaries during quantization.
+        """
 
         marker = f"{prefix}."
-        filtered_state = {
-            key[len(marker) :]: value
-            for key, value in state_dict.items()
-            if key.startswith(marker)
-        }
-        if not filtered_state:
+        matching_keys = [key for key in state_dict if key.startswith(marker)]
+        if not matching_keys:
             raise RuntimeError(f"The checkpoint does not contain the required '{marker}' namespace.")
+        for key in tuple(state_dict):
+            if not key.startswith(marker):
+                del state_dict[key]
+        for key in matching_keys:
+            state_dict[key[len(marker) :]] = state_dict.pop(key)
 
         if quantization_map is None:
-            filtered_quantization = None
+            pass
         else:
-            filtered_quantization = {
-                key[len(marker) :]: value
-                for key, value in quantization_map.items()
-                if key.startswith(marker)
-            }
-        return filtered_state, filtered_quantization
+            matching_keys = [key for key in quantization_map if key.startswith(marker)]
+            for key in tuple(quantization_map):
+                if not key.startswith(marker):
+                    del quantization_map[key]
+            for key in matching_keys:
+                quantization_map[key[len(marker) :]] = quantization_map.pop(key)
+        return state_dict, quantization_map
 
     def _generate_shape(
         self,
@@ -470,12 +509,12 @@ class Hunyuan3D21LowVRAMGenerator(BaseGenerator):
             raise RuntimeError("The 2.1 pipeline did not return a mesh.")
         return outputs[0]
 
-    def _release_shape(self) -> None:
+    def _release_shape(self, *, aggressive: bool = True) -> None:
         release_offloader(self._shape_offloader)
         self._shape_offloader = None
         self._shape_pipeline = None
         self._shape_precision = None
-        trim_process_memory()
+        trim_process_memory(aggressive=aggressive)
 
     def _preprocess(self, image_bytes: bytes, remove_background: bool) -> Image.Image:
         image = Image.open(io.BytesIO(image_bytes))
