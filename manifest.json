@@ -3,8 +3,8 @@
   "name": "Hunyuan3D 2.1 Full - Low VRAM",
   "type": "model",
   "source": "https://github.com/AlefK1708/modly-hunyuan3d-21-lowvram",
-  "description": "Full Hunyuan Shape 2.1 (3.3B, no Mini/Turbo and no Paint), with low-RAM mmap/meta loading, streamed mesh reconstruction, and native GLB export in Modly.",
-  "version": "0.4.0",
+  "description": "Full Hunyuan Shape 2.1 (3.3B, no Mini/Turbo and no Paint), with low-RAM mmap/meta loading, persistent INT8/FP8 cache, streamed mesh reconstruction, and native GLB export in Modly.",
+  "version": "0.5.0",
   "author": "AlefK1708",
   "vram_gb": 8,
   "generator_class": "Hunyuan3D21LowVRAMGenerator",
@@ -29,7 +29,7 @@
             {"value": "fp8", "label": "FP8 - experimental"},
             {"value": "fp16", "label": "FP16 - high RAM usage"}
           ],
-          "tooltip": "Quantization is performed locally at runtime. INT8 uses less RAM; FP16 preserves the original weights but relies heavily on the Windows page file."
+          "tooltip": "INT8/FP8 are converted locally once and cached on disk for faster, lower-pressure startup later. FP16 preserves the original weights but relies heavily on the Windows page file."
         },
         {
           "id": "num_inference_steps",

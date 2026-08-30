@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 import tempfile
 import threading
 import types
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -203,6 +206,220 @@ class GeneratorMemoryTests(unittest.TestCase):
         self.assertTrue(output.name.endswith(".glb"))
         self.assertLess(events.index("release:False"), events.index("export"))
         self.assertEqual(events[-1], "final-cleanup")
+
+    def test_quantized_cache_is_reusable_and_invalidates_when_source_changes(self):
+        generator_class = self.module.Hunyuan3D21LowVRAMGenerator
+
+        class TensorMetadata:
+            @staticmethod
+            def numel():
+                return 16
+
+            @staticmethod
+            def element_size():
+                return 1
+
+        class Module:
+            @staticmethod
+            def state_dict():
+                return {"weight._data": TensorMetadata()}
+
+        class Offload:
+            calls = []
+
+            @classmethod
+            def save_model(cls, _module, path, **kwargs):
+                cls.calls.append((Path(path), kwargs))
+                Path(path).write_bytes(b"q" * 2048)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = root / self.module.MODEL_FILE
+            config = root / "config.yaml"
+            checkpoint.write_bytes(b"source-checkpoint")
+            config.write_bytes(b"model: test\n")
+            components = {"model": Module(), "conditioner": Module()}
+
+            generator_class._save_quantized_cache(
+                components,
+                checkpoint,
+                config,
+                "int8",
+                Offload,
+            )
+
+            manifest_path = generator_class._quantized_cache_manifest_path(checkpoint, "int8")
+            self.assertTrue(manifest_path.is_file())
+            self.assertEqual(len(Offload.calls), 2)
+            for temporary_path, kwargs in Offload.calls:
+                self.assertFalse(temporary_path.exists())
+                self.assertFalse(kwargs["do_quantize"])
+
+            plan = generator_class._load_quantized_cache_plan(checkpoint, config, "int8")
+            self.assertEqual(set(plan), {"model", "conditioner"})
+            self.assertTrue(all(path.is_file() for path in plan.values()))
+
+            checkpoint.write_bytes(b"changed-source-checkpoint")
+            self.assertIsNone(
+                generator_class._load_quantized_cache_plan(checkpoint, config, "int8")
+            )
+
+    def test_incomplete_cache_never_publishes_a_manifest(self):
+        generator_class = self.module.Hunyuan3D21LowVRAMGenerator
+
+        class Module:
+            @staticmethod
+            def state_dict():
+                return {}
+
+        class FailingOffload:
+            calls = 0
+
+            @classmethod
+            def save_model(cls, _module, path, **_kwargs):
+                cls.calls += 1
+                if cls.calls == 2:
+                    raise OSError("simulated disk failure")
+                Path(path).write_bytes(b"q" * 2048)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = root / self.module.MODEL_FILE
+            config = root / "config.yaml"
+            checkpoint.write_bytes(b"source-checkpoint")
+            config.write_bytes(b"model: test\n")
+            manifest_path = generator_class._quantized_cache_manifest_path(checkpoint, "fp8")
+            manifest_path.parent.mkdir(parents=True)
+            manifest_path.write_text(json.dumps({"old": True}), encoding="utf-8")
+
+            with self.assertRaisesRegex(OSError, "simulated disk failure"):
+                generator_class._save_quantized_cache(
+                    {"model": Module(), "conditioner": Module()},
+                    checkpoint,
+                    config,
+                    "fp8",
+                    FailingOffload,
+                )
+
+            self.assertFalse(manifest_path.exists())
+            self.assertIsNone(
+                generator_class._load_quantized_cache_plan(checkpoint, config, "fp8")
+            )
+
+    def test_cache_manifest_cannot_redirect_component_paths(self):
+        generator_class = self.module.Hunyuan3D21LowVRAMGenerator
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = root / self.module.MODEL_FILE
+            config = root / "config.yaml"
+            checkpoint.write_bytes(b"source-checkpoint")
+            config.write_bytes(b"model: test\n")
+            manifest_path = generator_class._quantized_cache_manifest_path(checkpoint, "int8")
+            manifest_path.parent.mkdir(parents=True)
+
+            manifest = generator_class._quantized_cache_context(checkpoint, config, "int8")
+            manifest["components"] = {
+                "model": {"file": "../transformer.safetensors", "size": 2048},
+                "conditioner": {"file": "conditioner.safetensors", "size": 2048},
+            }
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            self.assertIsNone(
+                generator_class._load_quantized_cache_plan(checkpoint, config, "int8")
+            )
+
+    def test_valid_cache_skips_transformer_and_conditioner_quantization(self):
+        generator_class = self.module.Hunyuan3D21LowVRAMGenerator
+
+        class FakeModule:
+            def __init__(self, name):
+                self.name = name
+
+            def eval(self):
+                return self
+
+            def requires_grad_(self, _enabled):
+                return self
+
+        class Pipeline:
+            def __init__(self, **components):
+                self.__dict__.update(components)
+
+        calls = []
+
+        class Offload:
+            @staticmethod
+            def load_model_data(module, path, **kwargs):
+                calls.append((module.name, Path(path), kwargs))
+
+        pipelines_module = types.ModuleType("hy3dshape.pipelines")
+        pipelines_module.Hunyuan3DDiTFlowMatchingPipeline = Pipeline
+        pipelines_module.instantiate_from_config = lambda name: FakeModule(name)
+        hy3dshape_module = types.ModuleType("hy3dshape")
+        hy3dshape_module.__path__ = []
+        accelerate_module = types.ModuleType("accelerate")
+        accelerate_module.init_empty_weights = lambda **_kwargs: nullcontext()
+        mmgp_module = types.ModuleType("mmgp")
+        mmgp_module.offload = Offload
+        quanto_module = types.ModuleType("optimum.quanto")
+        quanto_module.qfloat8 = object()
+        quanto_module.qint8 = object()
+        optimum_module = types.ModuleType("optimum")
+        optimum_module.__path__ = []
+        torch_module = types.ModuleType("torch")
+        torch_module.device = lambda value: value
+        torch_module.float16 = "float16"
+
+        injected_modules = {
+            "accelerate": accelerate_module,
+            "hy3dshape": hy3dshape_module,
+            "hy3dshape.pipelines": pipelines_module,
+            "mmgp": mmgp_module,
+            "optimum": optimum_module,
+            "optimum.quanto": quanto_module,
+            "torch": torch_module,
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = root / self.module.MODEL_FILE
+            config = root / "config.yaml"
+            checkpoint.write_bytes(b"source-checkpoint")
+            config.write_text(
+                "model: model\n"
+                "vae: vae\n"
+                "conditioner: conditioner\n"
+                "image_processor: image_processor\n"
+                "scheduler: scheduler\n",
+                encoding="utf-8",
+            )
+            cache_dir = generator_class._quantized_cache_dir(checkpoint, "int8")
+            cache_dir.mkdir(parents=True)
+            component_metadata = {}
+            for component, filename in self.module.CACHE_COMPONENT_FILES.items():
+                component_path = cache_dir / filename
+                component_path.write_bytes(b"q" * 2048)
+                component_metadata[component] = {"file": filename, "size": 2048}
+            manifest = generator_class._quantized_cache_context(checkpoint, config, "int8")
+            manifest["components"] = component_metadata
+            generator_class._atomic_write_json(cache_dir / self.module.CACHE_MANIFEST_FILE, manifest)
+
+            with mock.patch.dict(sys.modules, injected_modules):
+                pipeline = generator_class._load_shape_pipeline_low_ram(
+                    checkpoint,
+                    config,
+                    "int8",
+                )
+
+        self.assertEqual(pipeline.model.name, "model")
+        self.assertEqual([name for name, _path, _kwargs in calls], ["model", "conditioner", "vae"])
+        self.assertEqual(calls[0][1].name, "transformer.safetensors")
+        self.assertEqual(calls[1][1].name, "conditioner.safetensors")
+        self.assertEqual(calls[2][1], checkpoint)
+        self.assertTrue(all(call_kwargs["do_quantize"] is False for _name, _path, call_kwargs in calls))
+        self.assertNotIn("preprocess_sd", calls[0][2])
+        self.assertIn("preprocess_sd", calls[2][2])
 
 
 class VolumeDecoderMemoryTests(unittest.TestCase):

@@ -2,20 +2,25 @@
 
 This is not the Mini, Turbo, or Turbo Mini model. FP16 weights are loaded from
 a lossless safetensors repack and quantized locally with MMGP/Quanto when INT8
-or FP8 is selected. The adapter generates geometry only and exports GLB files.
+or FP8 is first selected. The result is cached for direct mmap loading on later
+runs. The adapter generates geometry only and exports GLB files.
 """
 
 from __future__ import annotations
 
 import io
 import gc
+import hashlib
+import json
 import os
 import random
+import shutil
 import sys
 import threading
 import time
 import uuid
 from contextlib import contextmanager
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -27,6 +32,15 @@ from services.generators.base import BaseGenerator
 MODEL_FILE = "hunyuan_3d_v2.1.safetensors"
 MODEL_BYTES = 7_365_943_290
 MODEL_SHA256 = "5f21e98a6cb99b13b5e224abaee33929570fff7af2b6a0060001559a04ba9d72"
+CACHE_FORMAT_VERSION = 1
+CACHE_DIR_NAME = "_quantized_cache"
+CACHE_MANIFEST_FILE = "manifest.json"
+CACHE_COMPONENT_FILES = {
+    "model": "transformer.safetensors",
+    "conditioner": "conditioner.safetensors",
+}
+CACHE_MIN_FILE_BYTES = 1024
+CACHE_WRITE_MARGIN_BYTES = 512 * 1024**2
 
 
 def release_offloader(offloader) -> None:
@@ -288,6 +302,188 @@ class Hunyuan3D21LowVRAMGenerator(BaseGenerator):
         if path not in sys.path:
             sys.path.insert(0, path)
 
+    @staticmethod
+    def _installed_version(distribution: str) -> str:
+        """Return a stable cache key even in partially configured environments."""
+
+        try:
+            return importlib_metadata.version(distribution)
+        except importlib_metadata.PackageNotFoundError:
+            return "unknown"
+
+    @classmethod
+    def _quantized_cache_context(cls, ckpt: Path, config_path: Path, precision: str) -> dict:
+        """Describe everything that can change the serialized quantized tensors."""
+
+        source_stat = ckpt.stat()
+        return {
+            "format_version": CACHE_FORMAT_VERSION,
+            "precision": precision,
+            "source": {
+                "file": ckpt.name,
+                "size": source_stat.st_size,
+                "mtime_ns": source_stat.st_mtime_ns,
+                "expected_sha256": MODEL_SHA256,
+            },
+            "loader_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            "config_sha256": hashlib.sha256(config_path.read_bytes()).hexdigest(),
+            "runtime": {
+                "mmgp": cls._installed_version("mmgp"),
+                "optimum_quanto": cls._installed_version("optimum-quanto"),
+                "torch": cls._installed_version("torch"),
+            },
+        }
+
+    @staticmethod
+    def _quantized_cache_dir(ckpt: Path, precision: str) -> Path:
+        return ckpt.parent / CACHE_DIR_NAME / precision
+
+    @classmethod
+    def _quantized_cache_manifest_path(cls, ckpt: Path, precision: str) -> Path:
+        return cls._quantized_cache_dir(ckpt, precision) / CACHE_MANIFEST_FILE
+
+    @staticmethod
+    def _atomic_write_json(path: Path, payload: dict) -> None:
+        """Publish a manifest only after its complete contents reach disk."""
+
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            temporary.write_text(
+                json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    @classmethod
+    def _load_quantized_cache_plan(cls, ckpt: Path, config_path: Path, precision: str):
+        """Return validated component paths, or ``None`` for a safe rebuild."""
+
+        if precision == "fp16":
+            return None
+
+        manifest_path = cls._quantized_cache_manifest_path(ckpt, precision)
+        if not manifest_path.is_file():
+            return None
+
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            expected = cls._quantized_cache_context(ckpt, config_path, precision)
+            for key, value in expected.items():
+                if manifest.get(key) != value:
+                    raise ValueError(f"cache key '{key}' changed")
+
+            cache_dir = manifest_path.parent
+            component_metadata = manifest.get("components")
+            if not isinstance(component_metadata, dict):
+                raise ValueError("component metadata is missing")
+
+            component_paths = {}
+            for component, expected_file in CACHE_COMPONENT_FILES.items():
+                metadata = component_metadata.get(component)
+                if not isinstance(metadata, dict):
+                    raise ValueError(f"metadata for {component} is missing")
+                filename = metadata.get("file")
+                expected_size = metadata.get("size")
+                if filename != expected_file or Path(filename).name != filename:
+                    raise ValueError(f"unsafe or unexpected filename for {component}")
+                if not isinstance(expected_size, int) or expected_size < CACHE_MIN_FILE_BYTES:
+                    raise ValueError(f"invalid file size for {component}")
+                component_path = cache_dir / filename
+                if not component_path.is_file() or component_path.stat().st_size != expected_size:
+                    raise ValueError(f"cached {component} file is missing or incomplete")
+                component_paths[component] = component_path
+            return component_paths
+        except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            print(f"[Hunyuan3D21] Ignoring stale or incomplete {precision.upper()} cache: {exc}")
+            return None
+
+    @classmethod
+    def _invalidate_quantized_cache_manifest(cls, ckpt: Path, precision: str) -> None:
+        try:
+            cls._quantized_cache_manifest_path(ckpt, precision).unlink(missing_ok=True)
+        except OSError as exc:
+            print(f"[Hunyuan3D21] Warning: could not invalidate quantized cache manifest: {exc}")
+
+    @staticmethod
+    def _serialized_tensor_bytes(modules) -> int:
+        """Estimate output space without cloning parameter storage."""
+
+        total = 0
+        for module in modules:
+            state_dict = module.state_dict()
+            try:
+                for tensor in state_dict.values():
+                    try:
+                        total += tensor.numel() * tensor.element_size()
+                    except (AttributeError, RuntimeError, TypeError):
+                        # Some quantized tensor wrappers expose their storage
+                        # only while MMGP serializes them. The write still has
+                        # its own failure-safe temporary file in that case.
+                        continue
+            finally:
+                del state_dict
+        return total
+
+    @classmethod
+    def _save_quantized_cache(
+        cls,
+        components: dict,
+        ckpt: Path,
+        config_path: Path,
+        precision: str,
+        offload,
+    ) -> None:
+        """Atomically persist Quanto tensors for direct mmap loading next time."""
+
+        if precision == "fp16":
+            return
+
+        cache_dir = cls._quantized_cache_dir(ckpt, precision)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        manifest_path = cache_dir / CACHE_MANIFEST_FILE
+
+        # The manifest is the commit marker. Removing it first means a crash or
+        # disk-full error can leave only harmless, unreferenced component files.
+        manifest_path.unlink(missing_ok=True)
+        estimated_bytes = cls._serialized_tensor_bytes(
+            (components[component] for component in CACHE_COMPONENT_FILES)
+        )
+        free_bytes = shutil.disk_usage(cache_dir).free
+        if estimated_bytes and free_bytes < estimated_bytes + CACHE_WRITE_MARGIN_BYTES:
+            required_gib = (estimated_bytes + CACHE_WRITE_MARGIN_BYTES) / 1024**3
+            available_gib = free_bytes / 1024**3
+            raise OSError(
+                f"not enough free disk space for the cache "
+                f"({available_gib:.1f} GiB available; about {required_gib:.1f} GiB required)"
+            )
+
+        component_metadata = {}
+        for component, filename in CACHE_COMPONENT_FILES.items():
+            final_path = cache_dir / filename
+            temporary = cache_dir / f".{Path(filename).stem}.{uuid.uuid4().hex}.tmp.safetensors"
+            try:
+                print(f"[Hunyuan3D21] Saving reusable {precision.upper()} {component} cache...")
+                offload.save_model(
+                    components[component],
+                    str(temporary),
+                    do_quantize=False,
+                    verboseLevel=1,
+                )
+                size = temporary.stat().st_size
+                if size < CACHE_MIN_FILE_BYTES:
+                    raise OSError(f"serialized {component} cache is unexpectedly small")
+                os.replace(temporary, final_path)
+                component_metadata[component] = {"file": filename, "size": size}
+            finally:
+                temporary.unlink(missing_ok=True)
+
+        manifest = cls._quantized_cache_context(ckpt, config_path, precision)
+        manifest["components"] = component_metadata
+        cls._atomic_write_json(manifest_path, manifest)
+        print(f"[Hunyuan3D21] Reusable {precision.upper()} cache ready at {cache_dir}.")
+
     def _ensure_shape_pipeline(self, precision: str) -> None:
         if self._shape_pipeline is not None and self._shape_precision == precision:
             return
@@ -340,8 +536,8 @@ class Hunyuan3D21LowVRAMGenerator(BaseGenerator):
         self._shape_precision = precision
         print(f"[Hunyuan3D21] Pipeline ready in {precision.upper()} with MMGP streaming.")
 
-    @staticmethod
-    def _load_shape_pipeline_low_ram(ckpt: Path, config_path: Path, precision: str):
+    @classmethod
+    def _load_shape_pipeline_low_ram(cls, ckpt: Path, config_path: Path, precision: str):
         """Build Shape 2.1 without ever allocating its FP32 initialization.
 
         Tencent's ``from_single_file`` first constructs every parameter with
@@ -351,9 +547,11 @@ class Hunyuan3D21LowVRAMGenerator(BaseGenerator):
 
         MMGP exposes a loader designed for this case: instantiate parameters on
         the ``meta`` device, assign read-only mmap tensors from safetensors, and
-        quantize each component in place.  No full FP32 or duplicate FP16 model
-        is created.  Buffers stay on CPU because non-persistent buffers are not
-        present in the checkpoint.
+        quantize each component in place. Once INT8/FP8 conversion succeeds, a
+        persistent Quanto-aware cache is written atomically. Future runs mmap
+        those tensors directly and skip conversion. No full FP32 or duplicate
+        FP16 model is created. Buffers stay on CPU because non-persistent buffers
+        are not present in the checkpoint.
         """
 
         import yaml
@@ -371,51 +569,96 @@ class Hunyuan3D21LowVRAMGenerator(BaseGenerator):
         with config_path.open("r", encoding="utf-8") as stream:
             config = yaml.safe_load(stream)
 
-        components = {}
-        try:
+        def instantiate_empty_components():
             # include_buffers=False is deliberate: position ids and other
             # non-persistent buffers are absent from safetensors and must be
             # materialized normally rather than left on the meta device.
             with init_empty_weights(include_buffers=False):
-                components["model"] = instantiate_from_config(config["model"])
-                components["vae"] = instantiate_from_config(config["vae"])
-                components["conditioner"] = instantiate_from_config(config["conditioner"])
+                return {
+                    "model": instantiate_from_config(config["model"]),
+                    "vae": instantiate_from_config(config["vae"]),
+                    "conditioner": instantiate_from_config(config["conditioner"]),
+                }
 
+        components = {}
+        module = None
+        try:
+            components = instantiate_empty_components()
             quantized = precision != "fp16"
             qtype = qfloat8 if precision == "fp8" else qint8
-            load_plan = (
-                ("model", "transformer", quantized),
-                ("conditioner", "conditioner", quantized),
-                ("vae", "shape VAE", False),
+            cache_plan = cls._load_quantized_cache_plan(ckpt, config_path, precision)
+            loaded_quantized_cache = False
+
+            if cache_plan is not None:
+                try:
+                    for component, label in (("model", "transformer"), ("conditioner", "conditioner")):
+                        print(f"[Hunyuan3D21] Loading cached {precision.upper()} {label} through mmap...")
+                        module = components[component]
+                        offload.load_model_data(
+                            module,
+                            str(cache_plan[component]),
+                            do_quantize=False,
+                            writable_tensors=False,
+                            verboseLevel=1,
+                        )
+                        module.eval().requires_grad_(False)
+                        module = None
+                        trim_process_memory(aggressive=False)
+                    loaded_quantized_cache = True
+                    print(f"[Hunyuan3D21] Loaded reusable {precision.upper()} cache; runtime quantization skipped.")
+                except Exception as exc:
+                    print(f"[Hunyuan3D21] Cached weights failed to load; rebuilding safely: {exc}")
+                    module = None
+                    components.clear()
+                    cls._invalidate_quantized_cache_manifest(ckpt, precision)
+                    trim_process_memory()
+                    components = instantiate_empty_components()
+
+            if not loaded_quantized_cache:
+                for component, label in (("model", "transformer"), ("conditioner", "conditioner")):
+                    print(
+                        f"[Hunyuan3D21] Loading {label} through mmap"
+                        + (f" and quantizing to {precision.upper()}..." if quantized else "...")
+                    )
+                    module = components[component]
+                    offload.load_model_data(
+                        module,
+                        str(ckpt),
+                        do_quantize=quantized,
+                        quantizationType=qtype,
+                        # MMGP's generic modelPrefix also matches ".model."
+                        # inside conditioner keys, then abandons filtering when
+                        # it reaches the real top-level "model." namespace.
+                        preprocess_sd=partial(cls._filter_shape_namespace, prefix=component),
+                        writable_tensors=False,
+                        verboseLevel=1,
+                    )
+                    module.eval().requires_grad_(False)
+                    module = None
+                    trim_process_memory(aggressive=False)
+
+                if quantized:
+                    try:
+                        cls._save_quantized_cache(components, ckpt, config_path, precision, offload)
+                    except Exception as exc:
+                        # Cache creation is an optimization. A read-only model
+                        # directory or full disk must never block generation.
+                        cls._invalidate_quantized_cache_manifest(ckpt, precision)
+                        print(f"[Hunyuan3D21] Warning: quantized cache was not saved: {exc}")
+
+            print("[Hunyuan3D21] Loading shape VAE from the source checkpoint through mmap...")
+            module = components["vae"]
+            offload.load_model_data(
+                module,
+                str(ckpt),
+                do_quantize=False,
+                preprocess_sd=partial(cls._filter_shape_namespace, prefix="vae"),
+                writable_tensors=False,
+                verboseLevel=1,
             )
-            for prefix, label, quantize_component in load_plan:
-                print(
-                    f"[Hunyuan3D21] Loading {label} through mmap"
-                    + (f" and quantizing to {precision.upper()}..." if quantize_component else "...")
-                )
-                module = components[prefix]
-                offload.load_model_data(
-                    module,
-                    str(ckpt),
-                    do_quantize=quantize_component,
-                    quantizationType=qtype,
-                    # MMGP's generic modelPrefix also matches ".model."
-                    # inside conditioner keys, then abandons filtering when it
-                    # later reaches the real top-level "model." namespace.
-                    # An exact startswith filter avoids leaving meta parameters
-                    # such as x_embedder.weight without checkpoint data.
-                    preprocess_sd=partial(
-                        Hunyuan3D21LowVRAMGenerator._filter_shape_namespace,
-                        prefix=prefix,
-                    ),
-                    writable_tensors=False,
-                    verboseLevel=1,
-                )
-                module.eval().requires_grad_(False)
-                # Release dead mappings before opening the next namespace, but
-                # keep hot model pages resident so the following MMGP scan does
-                # not have to page them back in.
-                trim_process_memory(aggressive=False)
+            module.eval().requires_grad_(False)
+            module = None
+            trim_process_memory(aggressive=False)
 
             image_processor = instantiate_from_config(config["image_processor"])
             scheduler = instantiate_from_config(config["scheduler"])
@@ -434,6 +677,7 @@ class Hunyuan3D21LowVRAMGenerator(BaseGenerator):
             pipeline.dtype = torch.float16
             return pipeline
         except Exception:
+            module = None
             components.clear()
             trim_process_memory()
             raise

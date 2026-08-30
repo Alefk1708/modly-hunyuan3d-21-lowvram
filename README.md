@@ -3,7 +3,7 @@
 Native [Modly](https://github.com/lightningpixel/modly) extension for generating **3D meshes** from an image with the **full Hunyuan Shape 2.1 model (3.3B)** on NVIDIA GPUs with limited VRAM.
 
 - Author and maintainer: **AlefK1708**
-- Version: **0.4.0**
+- Version: **0.5.0**
 - Repository: [AlefK1708/modly-hunyuan3d-21-lowvram](https://github.com/AlefK1708/modly-hunyuan3d-21-lowvram)
 - Model: Hunyuan3D Shape 2.1 Full - this is not Mini, Turbo, or Turbo Mini.
 - Backend: native Modly Python integration; **no ComfyUI, Gradio, or external server is used**.
@@ -18,12 +18,26 @@ Main features:
 - Full Hunyuan Shape 2.1 with the complete Safetensors checkpoint.
 - INT8 recommended for GPUs with 8 GB of VRAM, experimental FP8, and FP16.
 - `meta` initialization, memory-mapped Safetensors loading, and MMGP offloading to reduce RAM peaks.
+- Persistent, versioned INT8/FP8 disk cache that skips repeated runtime quantization.
 - Chunk-streamed dense-grid reconstruction without allocating a complete XYZ cube in RAM.
 - Optional CPU background removal with `rembg`.
 - Native GLB export without Blender.
 - Attempts to release the heavy pipeline and RAM/VRAM caches after every generation, including errors and cancellations.
 
 The extension returns the geometry produced by Hunyuan Shape without automatic polygon reduction. If you want a lower-poly mesh, connect a dedicated mesh optimization node later in the Modly Workflow.
+
+## v0.5.0
+
+This release adds a safe persistent cache for quantized weights:
+
+- The first use of INT8 or FP8 still converts the original FP16 checkpoint locally, then saves the transformer and conditioner in MMGP/Quanto-aware Safetensors files.
+- Later generations load those already-quantized files directly through read-only memory mapping, avoiding the repeated conversion pass and its temporary RAM pressure.
+- INT8 and FP8 have separate caches under the model directory: `_quantized_cache/int8/` and `_quantized_cache/fp8/`.
+- A manifest binds each cache to the source checkpoint, Hunyuan configuration, precision, cache format, PyTorch, MMGP, and Quanto versions. A mismatch automatically triggers a safe rebuild.
+- Component files are written to unique temporary paths and the manifest is published last. Interrupted or incomplete writes are therefore never treated as valid.
+- If the model directory is read-only, the disk is full, or a cache cannot be loaded, generation falls back to the original checkpoint. Cache creation is an optimization and does not become a new runtime requirement.
+
+The cache is stored on disk, not permanently kept in RAM. The heavy pipeline continues to be released after every generation. Delete only the relevant `_quantized_cache/int8/` or `_quantized_cache/fp8/` directory if you want to force a rebuild; the original 6.86 GiB checkpoint is preserved.
 
 ## v0.4.0
 
@@ -81,7 +95,9 @@ Weight source: `Comfy-Org/hunyuan3D_2.1_repackaged`.
 
 That repository only hosts the **repackaged Safetensors** used by this extension. The generator does not start or depend on ComfyUI.
 
-INT8 and FP8 are produced locally from the same Safetensors checkpoint. Updating the extension does not require a separate INT8/FP8 checkpoint, and an existing complete Shape checkpoint in Modly's model directory can be reused.
+INT8 and FP8 are produced locally from the same Safetensors checkpoint. Starting with v0.5.0, the first successful conversion is cached beside the model and reused on later runs. Updating the extension does not require a separate download, and an existing complete Shape checkpoint in Modly's model directory can be reused.
+
+The local cache uses several additional GiB of disk space for each precision actually selected. It is created on demand; choosing only INT8 does not create an FP8 cache.
 
 The first background-removal run may download the U2Net model used by `rembg` if it is not already cached.
 
@@ -125,7 +141,7 @@ The node output type is `mesh`, exactly as declared in `manifest.json`, so it re
 
 ## RAM and VRAM
 
-INT8 preparation can use a significant amount of RAM, CPU, and disk activity. The loader processes the checkpoint component by component through memory mapping and uses MMGP/Quanto to avoid keeping a second complete FP32 copy of the model. During mesh reconstruction, v0.4.0 keeps only the current coordinate chunk instead of the complete dense XYZ grid.
+The first INT8 or FP8 preparation can use a significant amount of RAM, CPU, and disk activity. The loader processes the checkpoint component by component through memory mapping and uses MMGP/Quanto to avoid keeping a second complete FP32 copy of the model. Once the persistent cache is valid, later runs skip quantization and mmap the smaller prequantized component files. During mesh reconstruction, the decoder keeps only the current coordinate chunk instead of the complete dense XYZ grid.
 
 At the end of generation, the UI should reach the memory-release stage and the log records:
 
@@ -134,6 +150,8 @@ At the end of generation, the UI should reach the memory-release stage and the l
 ```
 
 Windows can still show loaded libraries, file cache, reserved memory, or standby memory for the Modly extension process after cleanup. That reading alone does not mean the full Hunyuan pipeline is still loaded.
+
+The operating system may use otherwise-free RAM as a file cache for the persistent Safetensors. This memory is reclaimable and is different from retaining the Hunyuan pipeline as live Python model objects.
 
 ## Common issues
 
@@ -149,8 +167,16 @@ Windows can still show loaded libraries, file cache, reserved memory, or standby
 
 - On a 16 GB PC, make sure a 32-48 GB page file is configured on an SSD.
 - Close browsers, games, and other memory-heavy applications.
+- Let the first INT8/FP8 run finish writing its cache; later startup should be faster and have less conversion pressure.
 - Wait for post-generation cleanup before starting another run.
 - For frequent use, 32 GB of physical RAM is much more comfortable.
+
+### Quantized cache is rebuilt or cannot be saved
+
+- A rebuild after changing the extension, checkpoint, precision, or pinned runtime versions is expected and protects against incompatible tensors.
+- Make sure the drive containing Modly's model directory has several GiB of free space and is writable.
+- Generation can continue from the original checkpoint even when cache creation fails.
+- To repair a suspected cache without redownloading the model, delete only `_quantized_cache/int8/` or `_quantized_cache/fp8/`.
 
 ### `x_embedder.weight has no data`
 
